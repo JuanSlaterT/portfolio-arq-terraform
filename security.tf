@@ -11,7 +11,7 @@ resource "aws_security_group" "portfolio" {
 resource "aws_vpc_security_group_ingress_rule" "http" {
   security_group_id = aws_security_group.portfolio.id
 
-  description = "Allow HTTP for Let's Encrypt"
+  description = "Allow HTTP for Lets Encrypt"
 
   cidr_ipv4   = "0.0.0.0/0"
   from_port   = 80

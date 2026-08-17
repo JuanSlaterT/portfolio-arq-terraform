@@ -5,44 +5,24 @@ set -euxo pipefail
 DOMAIN="api-portfolio.zapto.org"
 BASE_DIR="/opt/portfolio"
 
-# =========================================================
-# Actualizar sistema
-# =========================================================
-
 dnf update -y
 
-# Instalar Docker, Git y OpenSSL
 dnf install -y \
     docker \
     git \
     openssl
-
-
-# =========================================================
-# Docker
-# =========================================================
 
 systemctl enable docker
 systemctl start docker
 
 usermod -aG docker ec2-user
 
-
-# =========================================================
-# AWS SSM
-# =========================================================
-
 systemctl enable amazon-ssm-agent
 systemctl start amazon-ssm-agent
 
-
-# =========================================================
-# Docker Compose
-# =========================================================
-
 mkdir -p /usr/local/lib/docker/cli-plugins
 
-curl -SL \
+curl -fSL \
     https://github.com/docker/compose/releases/download/v5.1.4/docker-compose-linux-x86_64 \
     -o /usr/local/lib/docker/cli-plugins/docker-compose
 
@@ -50,22 +30,9 @@ chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 docker compose version
 
-
-# =========================================================
-# Directorios
-# =========================================================
-
 mkdir -p "$BASE_DIR/nginx"
-mkdir -p "$BASE_DIR/certbot/www"
+mkdir -p "$BASE_DIR/certbot/www/.well-known/acme-challenge"
 mkdir -p "$BASE_DIR/certbot/conf"
-
-
-# =========================================================
-# Nginx HTTP temporal
-#
-# Necesitamos primero arrancar Nginx en puerto 80 para que
-# Let's Encrypt pueda validar el dominio mediante HTTP-01.
-# =========================================================
 
 cat > "$BASE_DIR/nginx/nginx.conf" <<'EOF'
 server {
@@ -87,11 +54,6 @@ server {
     }
 }
 EOF
-
-
-# =========================================================
-# Docker Compose
-# =========================================================
 
 cat > "$BASE_DIR/compose.yaml" <<'EOF'
 services:
@@ -115,7 +77,6 @@ services:
     depends_on:
       - bff
 
-
   certbot:
     image: certbot/certbot:latest
 
@@ -125,7 +86,6 @@ services:
     volumes:
       - ./certbot/www:/var/www/certbot
       - ./certbot/conf:/etc/letsencrypt
-
 
   bff:
     image: hotdoctor/portfolio-backend:latest
@@ -138,14 +98,12 @@ services:
       - edge
       - microservices
 
-
   language-service:
     image: hotdoctor/portfolio-microservices-language_service:latest
     restart: unless-stopped
 
     networks:
       - microservices
-
 
 networks:
 
@@ -156,17 +114,7 @@ networks:
     driver: bridge
 EOF
 
-
-# =========================================================
-# Permisos
-# =========================================================
-
 chown -R ec2-user:ec2-user "$BASE_DIR"
-
-
-# =========================================================
-# Levantar aplicación inicialmente por HTTP
-# =========================================================
 
 cd "$BASE_DIR"
 
@@ -174,10 +122,16 @@ docker compose pull nginx bff language-service certbot
 
 docker compose up -d nginx bff language-service
 
+sleep 5
 
-# =========================================================
-# Obtener certificado SSL Let's Encrypt
-# =========================================================
+docker compose exec -T nginx nginx -t
+
+echo "ok" > "$BASE_DIR/certbot/www/.well-known/acme-challenge/test"
+
+curl -fsS \
+    http://127.0.0.1/.well-known/acme-challenge/test
+
+rm -f "$BASE_DIR/certbot/www/.well-known/acme-challenge/test"
 
 if [ ! -f "$BASE_DIR/certbot/conf/live/$DOMAIN/fullchain.pem" ]; then
 
@@ -192,48 +146,31 @@ if [ ! -f "$BASE_DIR/certbot/conf/live/$DOMAIN/fullchain.pem" ]; then
 
 fi
 
-
-# =========================================================
-# Configuración definitiva Nginx HTTPS
-# =========================================================
+test -f "$BASE_DIR/certbot/conf/live/$DOMAIN/fullchain.pem"
+test -f "$BASE_DIR/certbot/conf/live/$DOMAIN/privkey.pem"
 
 cat > "$BASE_DIR/nginx/nginx.conf" <<'EOF'
-
-# ---------------------------------------------------------
-# HTTP
-# ---------------------------------------------------------
-
 server {
     listen 80;
 
     server_name api-portfolio.zapto.org;
 
-    # Certbot necesita acceso a esta ruta para renovar SSL
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
 
-    # Todo lo demás va a HTTPS
     location / {
         return 301 https://$host$request_uri;
     }
 }
-
-
-# ---------------------------------------------------------
-# HTTPS
-# ---------------------------------------------------------
 
 server {
     listen 443 ssl;
 
     server_name api-portfolio.zapto.org;
 
-    ssl_certificate \
-        /etc/letsencrypt/live/api-portfolio.zapto.org/fullchain.pem;
-
-    ssl_certificate_key \
-        /etc/letsencrypt/live/api-portfolio.zapto.org/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/api-portfolio.zapto.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api-portfolio.zapto.org/privkey.pem;
 
     ssl_protocols TLSv1.2 TLSv1.3;
 
@@ -246,22 +183,17 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
-
 EOF
-
-
-# =========================================================
-# Validar y recargar Nginx
-# =========================================================
 
 docker compose exec -T nginx nginx -t
 
 docker compose exec -T nginx nginx -s reload
 
+sleep 2
 
-# =========================================================
-# Renovación automática del certificado
-# =========================================================
+curl -vk \
+    --resolve "$DOMAIN:443:127.0.0.1" \
+    "https://$DOMAIN/"
 
 cat > /etc/systemd/system/portfolio-certbot-renew.service <<'EOF'
 [Unit]
@@ -272,11 +204,10 @@ After=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/portfolio
-
 ExecStart=/usr/bin/docker compose run --rm certbot renew --quiet
+ExecStartPost=/usr/bin/docker compose exec -T nginx nginx -t
 ExecStartPost=/usr/bin/docker compose exec -T nginx nginx -s reload
 EOF
-
 
 cat > /etc/systemd/system/portfolio-certbot-renew.timer <<'EOF'
 [Unit]
@@ -285,7 +216,6 @@ Description=Check Let's Encrypt certificate renewal
 [Timer]
 OnCalendar=*-*-* 03:00:00
 OnCalendar=*-*-* 15:00:00
-
 RandomizedDelaySec=30m
 Persistent=true
 
@@ -293,15 +223,9 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-
 systemctl daemon-reload
 
 systemctl enable --now portfolio-certbot-renew.timer
-
-
-# =========================================================
-# Estado final
-# =========================================================
 
 docker compose ps
 
