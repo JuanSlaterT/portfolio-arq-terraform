@@ -1,1179 +1,885 @@
 # Portfolio Backend Infrastructure — AWS + Terraform
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Terraform-%3E%3D%201.10-844FBA?logo=terraform&logoColor=white" alt="Terraform" />
-  <img src="https://img.shields.io/badge/AWS-us--east--1-232F3E?logo=amazonwebservices&logoColor=white" alt="AWS" />
+  <img src="https://img.shields.io/badge/Terraform-%3E%3D%201.10-844FBA?logo=terraform&logoColor=white" alt="Terraform 1.10 or newer" />
+  <img src="https://img.shields.io/badge/AWS%20Provider-6.60.0-232F3E?logo=amazonwebservices&logoColor=white" alt="AWS provider 6.60.0" />
   <img src="https://img.shields.io/badge/Amazon%20Linux-2023-FF9900" alt="Amazon Linux 2023" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose" />
   <img src="https://img.shields.io/badge/Nginx-Reverse%20Proxy-009639?logo=nginx&logoColor=white" alt="Nginx" />
   <img src="https://img.shields.io/badge/Let's%20Encrypt-TLS-003A70?logo=letsencrypt&logoColor=white" alt="Let's Encrypt" />
 </p>
 
-Infraestructura como código para desplegar un **backend orientado a microservicios** sobre una única instancia de Amazon EC2, utilizando Terraform para aprovisionar la red y los recursos AWS, Docker Compose para ejecutar el stack de aplicaciones, Nginx como único punto de entrada público y Let's Encrypt/Certbot para HTTPS.
+Terraform infrastructure for running a small, production-shaped portfolio backend on one Amazon EC2 instance. AWS provides the network, compute, static public IP, instance identity, and remote administration. Docker Compose runs the application stack. Nginx is the only public application entry point, Certbot manages TLS, and a Backend for Frontend (BFF) isolates two internal microservices from the Internet.
 
-El objetivo del proyecto es mantener una arquitectura sencilla de operar y suficientemente cercana a un entorno real de producción para un portafolio: red propia, IP pública estática, TLS, aislamiento entre contenedores, administración remota mediante AWS Systems Manager y un BFF que centraliza el acceso a los microservicios internos.
+The Compose definition contains five services: `nginx`, `certbot`, `bff`, `language-service`, and the new `stats-service`. Four are long-running; Certbot runs on demand for certificate issuance and renewal.
 
-> **Endpoint configurado:** `https://api-portfolio.zapto.org`
+> Public application endpoint: `https://api-portfolio.zapto.org`
+>
+> Repository status: this document describes the configuration currently present in the working tree. The local Terraform state proves that the AWS foundation has been managed from this project, but it does not prove that every un-applied working-tree change is already running in AWS.
 
----
+## Contents
 
-## Tabla de contenido
-
-- [Arquitectura](#arquitectura)
-- [Flujo de una petición](#flujo-de-una-petición)
-- [Componentes AWS](#componentes-aws)
-- [Stack interno de la EC2](#stack-interno-de-la-ec2)
-- [Redes Docker](#redes-docker)
-- [HTTPS y certificados](#https-y-certificados)
-- [Seguridad](#seguridad)
-- [Bootstrap con user_data](#bootstrap-con-user_data)
-- [Estructura del repositorio](#estructura-del-repositorio)
-- [Requisitos](#requisitos)
-- [Autenticación con AWS](#autenticación-con-aws)
-- [Despliegue](#despliegue)
-- [Variables](#variables)
+- [System overview](#system-overview)
+- [Request path](#request-path)
+- [AWS infrastructure](#aws-infrastructure)
+- [Container runtime](#container-runtime)
+- [Internal services](#internal-services)
+- [Docker network isolation](#docker-network-isolation)
+- [Configuration model](#configuration-model)
+- [EC2 bootstrap](#ec2-bootstrap)
+- [TLS lifecycle](#tls-lifecycle)
+- [Security model](#security-model)
+- [Repository layout](#repository-layout)
+- [Requirements](#requirements)
+- [Configure and deploy](#configure-and-deploy)
 - [Outputs](#outputs)
-- [Operación y diagnóstico](#operación-y-diagnóstico)
-- [Decisiones de diseño](#decisiones-de-diseño)
-- [Limitaciones actuales](#limitaciones-actuales)
-- [Mejoras futuras](#mejoras-futuras)
+- [Operations runbook](#operations-runbook)
+- [Troubleshooting](#troubleshooting)
+- [How changes are delivered](#how-changes-are-delivered)
+- [Current implementation notes](#current-implementation-notes)
+- [Limitations and roadmap](#limitations-and-roadmap)
+- [Design decisions](#design-decisions)
 
----
+## System overview
 
-# Arquitectura
+![Portfolio backend architecture showing AWS, EC2, Docker Compose, the BFF, language-service, and stats-service](./docs/architecture-v2.png)
 
-![Diagrama de arquitectura](./docs/architecture.png)
-
-La infraestructura está organizada en tres capas principales:
-
-1. **Entrada pública:** No-IP DNS → Elastic IP → EC2.
-2. **Infraestructura AWS:** VPC, subnet pública, Internet Gateway, Security Group, IAM y EC2.
-3. **Runtime interno:** Docker Compose → Nginx → BFF → microservicios.
+The system is intentionally compact: all application containers share one EC2 host, while network boundaries ensure that only Nginx is reachable from the public Internet.
 
 ```mermaid
 flowchart LR
-    U[Cliente / Frontend] --> DNS["No-IP DNS<br/>api-portfolio.zapto.org"]
-    DNS -->|A record| EIP[Elastic IP]
+    Client([Client / frontend]) --> DNS["No-IP DNS<br/>api-portfolio.zapto.org"]
+    DNS --> EIP["Elastic IP<br/>public IPv4"]
 
     subgraph AWS["AWS — us-east-1"]
         subgraph VPC["VPC 10.0.0.0/16"]
             IGW[Internet Gateway]
-
-            subgraph SUBNET["Public Subnet 10.0.1.0/24"]
-                SG["Security Group<br/>80 / 443 inbound"]
+            subgraph Subnet["Public subnet 10.0.1.0/24"]
                 EC2["EC2<br/>Amazon Linux 2023"]
             end
         end
     end
 
     EIP --> EC2
-    IGW --> SUBNET
-    SG --> EC2
+    IGW --> Subnet
 
-    subgraph DOCKER["Docker Compose"]
-        NGINX["Nginx<br/>80 / 443"]
-        BFF["portfolio-backend<br/>BFF :8080"]
-        LANG["language-service<br/>:8081"]
-        CERTBOT["Certbot"]
+    subgraph Compose["Docker Compose on EC2"]
+        Nginx["Nginx<br/>80 / 443 public"]
+        BFF["Portfolio BFF<br/>8080 internal"]
+        Language["Language service<br/>8081 internal"]
+        Stats["Stats service<br/>8082 internal"]
+        Certbot["Certbot<br/>ACME client"]
     end
 
-    EC2 --> NGINX
-    NGINX -->|proxy_pass| BFF
-    BFF -->|LANGUAGE_SERVICE_URL| LANG
-    CERTBOT -. TLS certificates .-> NGINX
+    EC2 --> Nginx
+    Nginx --> BFF
+    BFF --> Language
+    BFF --> Stats
+    Certbot -. certificates .-> Nginx
 ```
 
----
+### Architecture at a glance
 
-# Flujo de una petición
+| Layer | Components | Responsibility |
+|---|---|---|
+| External | Clients, No-IP DNS, Let's Encrypt | Name resolution, API access, and certificate issuance |
+| AWS network | VPC, public subnet, Internet Gateway, route table | Public IPv4 connectivity for the host |
+| AWS security and identity | Security Group, IAM role, instance profile, SSM | Traffic filtering and administration without public SSH |
+| AWS compute | EC2, encrypted `gp3` root volume, Elastic IP | Single-host runtime with a stable public address |
+| Edge runtime | Nginx and Certbot | HTTP-to-HTTPS redirect, TLS termination, reverse proxy, and renewal |
+| Application runtime | BFF, language service, stats service | Public API aggregation and private domain functionality |
 
-Una llamada pública sigue este recorrido:
+## Request path
 
-```text
-Client
-  │
-  ▼
-api-portfolio.zapto.org
-  │
-  │  A record
-  ▼
-Elastic IP
-  │
-  ▼
-Amazon EC2
-  │
-  ▼
-Nginx :443
-  │
-  │  proxy_pass http://bff:8080
-  ▼
-BFF :8080
-  │
-  │  LANGUAGE_SERVICE_URL=http://language-service:8081
-  ▼
-Language Service :8081
+A normal API request enters through one controlled path. There is no direct public route to the BFF or either microservice.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant D as No-IP DNS
+    participant E as Elastic IP / EC2
+    participant N as Nginx :443
+    participant B as BFF :8080
+    participant L as language-service :8081
+    participant S as stats-service :8082
+
+    C->>D: Resolve api-portfolio.zapto.org
+    D-->>C: Elastic IP
+    C->>E: HTTPS request
+    E->>N: TCP 443
+    N->>B: HTTP over edge network
+    alt Language capability required
+        B->>L: HTTP over microservices network
+        L-->>B: Domain response
+    else Statistics capability required
+        B->>S: HTTP over microservices network
+        S-->>B: Aggregated statistics
+    end
+    B-->>N: API response
+    N-->>C: HTTPS response
 ```
 
-### 1. DNS
+1. No-IP resolves `api-portfolio.zapto.org` to the Terraform-managed Elastic IP.
+2. The EC2 Security Group accepts public IPv4 traffic only on TCP `80` and `443`.
+3. Nginx redirects ordinary HTTP traffic to HTTPS and terminates TLS on `443`.
+4. Nginx proxies the request to the BFF through the Docker `edge` network.
+5. The BFF calls `language-service` or `stats-service` through the private `microservices` network.
+6. Internal services return their result through the BFF; they never accept a direct Internet request.
 
-`api-portfolio.zapto.org` es administrado externamente mediante **No-IP**.
+Port `80` remains available for the ACME HTTP-01 challenge under `/.well-known/acme-challenge/`.
 
-El registro utilizado es un **A record**:
+## AWS infrastructure
 
-```text
-api-portfolio.zapto.org → Elastic IP de AWS
+```mermaid
+flowchart TB
+    AZs["AWS availability-zones data source"]
+    AMI["SSM public parameter<br/>latest AL2023 x86_64 AMI"]
+    VPC["VPC<br/>10.0.0.0/16"]
+    IGW[Internet Gateway]
+    RT["Public route table<br/>0.0.0.0/0 → IGW"]
+    Subnet["Public subnet<br/>10.0.1.0/24<br/>first available AZ"]
+    SG["Security Group<br/>in: 80, 443<br/>out: all"]
+    Role["IAM role<br/>AmazonSSMManagedInstanceCore"]
+    Profile[IAM instance profile]
+    EC2["EC2 instance<br/>t3.small by default<br/>encrypted gp3"]
+    EIP[Elastic IP]
+
+    AZs --> Subnet
+    VPC --> IGW
+    VPC --> RT
+    VPC --> Subnet
+    RT --> Subnet
+    IGW --> RT
+    VPC --> SG
+    Role --> Profile
+    AMI --> EC2
+    Subnet --> EC2
+    SG --> EC2
+    Profile --> EC2
+    EC2 --> EIP
 ```
 
-No-IP no forma parte del código Terraform actual; es una dependencia externa que debe mantenerse sincronizada con la Elastic IP.
+### Resource inventory
 
-### 2. Elastic IP
+| Resource | Current configuration |
+|---|---|
+| Provider | AWS `6.60.0`; region from `var.aws_region`, default `us-east-1` |
+| Default tags | `Project = var.project_name`, `Environment = production`, `ManagedBy = terraform` |
+| VPC | `10.0.0.0/16`, DNS support and DNS hostnames enabled |
+| Internet Gateway | Attached to the project VPC |
+| Public subnet | `10.0.1.0/24`, first available AZ, public IP assignment enabled |
+| Route table | Default IPv4 route `0.0.0.0/0` through the Internet Gateway |
+| Security Group | Public TCP `80` and `443`; unrestricted IPv4 egress |
+| AMI lookup | `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64` |
+| EC2 | `t3.small` by default, public subnet, public IPv4 plus associated EIP |
+| Root volume | `20 GiB` by default, `gp3`, encrypted, deleted on termination |
+| Metadata | Instance Metadata Service enabled; IMDSv2 tokens required |
+| IAM | Dedicated EC2 role and instance profile with `AmazonSSMManagedInstanceCore` |
+| Elastic IP | Associated directly with the EC2 instance after the Internet Gateway exists |
 
-Terraform crea una `aws_eip` y la asocia directamente a la instancia EC2.
+The AMI is discovered dynamically for new instances. Terraform ignores later AMI drift on an existing instance, so a newly published Amazon Linux image alone does not replace the server.
 
-La Elastic IP actúa como la dirección IPv4 pública estable de la arquitectura mientras el recurso continúe existiendo.
+The project currently uses a single public subnet and a single Availability Zone. There is no load balancer, NAT Gateway, Auto Scaling Group, or private EC2 subnet.
 
-### 3. Nginx
+## Container runtime
 
-Nginx es el **único punto de entrada público del backend**.
+`scripts/user_data.sh` renders the Compose definition and Nginx configuration into the deployment directory, `/opt/portfolio` by default.
 
-Recibe:
+```mermaid
+flowchart LR
+    Internet((Internet))
 
-- `TCP 80` para HTTP y validaciones ACME.
-- `TCP 443` para HTTPS.
+    subgraph Host["Amazon EC2 — Amazon Linux 2023"]
+        Docker[Docker Engine]
+        subgraph Stack["Docker Compose project"]
+            N["nginx:alpine<br/>host ports 80 and 443"]
+            C["certbot/certbot:latest<br/>on-demand profile"]
+            B["portfolio-backend<br/>BFF"]
+            L[language-service]
+            S[stats-service]
+        end
+        Config["Generated nginx.conf"]
+        ACME["Bind mounts<br/>certbot/www + certbot/conf"]
+    end
 
-El tráfico normal de HTTP se redirige a HTTPS y las peticiones HTTPS son enviadas al BFF:
-
-```nginx
-proxy_pass http://bff:8080;
+    Internet --> N
+    Docker --> Stack
+    Config --> N
+    C <--> ACME
+    ACME <--> N
+    N --> B
+    B --> L
+    B --> S
 ```
 
-### 4. BFF
+### Service catalog
 
-El contenedor `portfolio-backend` funciona como **Backend For Frontend**.
+| Compose service | Image expression | Network membership | Exposure | Purpose |
+|---|---|---|---|---|
+| `nginx` | `nginx:alpine` | `edge` | Host `80:80`, `443:443` | Redirect, ACME path, TLS termination, reverse proxy |
+| `certbot` | `certbot/certbot:latest` | Compose implicit default network when run | No published port | Initial certificate request and renewal; communicates through shared files |
+| `bff` | `${dockerhub_username}/portfolio-backend:${bff_version}` | `edge`, `microservices` | No host port | Single application gateway and microservice aggregator |
+| `language-service` | `${dockerhub_username}/portfolio-microservices-language_service:${language_version}` | `microservices` | No host port; expected internally on `8081` | Language-related domain capability |
+| `stats-service` | `${dockerhub_username}/portfolio-microservices-stats_service:${language_version}` as currently coded | `microservices` | No host port; expected internally on `8082` | Statistics aggregation through external providers |
 
-El BFF es accesible por Nginx dentro de la red Docker `edge`, pero su puerto `8080` no se publica en el host.
+All long-running application containers use `restart: unless-stopped`. Certbot is placed behind the `certbot` Compose profile and is invoked as a one-off container.
 
-Además, el BFF tiene acceso a la red interna `microservices`, por lo que puede consumir los servicios de dominio.
+> The stats image currently uses `language_version` in `ec2.tf`. A separate required `stats_version` variable exists, but it is not yet wired into `local.stats_image`. See [Current implementation notes](#current-implementation-notes).
 
-### 5. Microservicios
+## Internal services
 
-Actualmente existe:
+### Backend for Frontend
 
-```text
-language-service:8081
-```
+The BFF is the only application container visible to Nginx. It belongs to both custom networks and is therefore the deliberate bridge between the edge and domain layers.
 
-El BFF lo consume mediante:
+Its environment is supplied through the sensitive `bff_environment` map. The current local configuration defines these service-discovery keys:
 
 ```text
 LANGUAGE_SERVICE_URL=http://language-service:8081
+STATS_SERVICE_URL=http://stats-service:8082
 ```
 
-`language-service` no expone ningún puerto hacia Internet.
+Docker's embedded DNS resolves the Compose service names. No private EC2 IPs are needed for container-to-container calls.
 
----
+### Language service
 
-# Componentes AWS
+`language-service` is attached only to `microservices`. Terraform does not publish or declare a host mapping for `8081`; the BFF URL is the runtime contract that expects the application to listen on that internal port.
 
-## Provider
+### Stats service
 
-El provider AWS utiliza la región configurable mediante `var.aws_region`.
+`stats-service` is also attached only to `microservices`. It receives its own sensitive environment map, `stats_environment`. The current configuration contract contains:
 
-Valor por defecto:
-
-```text
-us-east-1
-```
-
-Todos los recursos reciben tags globales:
-
-```text
-Project     = portfolio
-Environment = production
-ManagedBy   = terraform
-```
-
----
-
-## VPC
-
-Terraform crea una VPC dedicada:
-
-```text
-10.0.0.0/16
-```
-
-Con:
-
-```hcl
-enable_dns_support   = true
-enable_dns_hostnames = true
-```
-
-Esto permite resolución DNS dentro de la VPC y prepara la red para servicios que dependan de nombres DNS privados.
-
----
-
-## Internet Gateway
-
-La VPC posee un **Internet Gateway** que permite conectividad entre la subnet pública e Internet.
-
-```text
-Internet
-   │
-   ▼
-Internet Gateway
-   │
-   ▼
-Public Route Table
-   │
-   ▼
-Public Subnet
-```
-
----
-
-## Public Subnet
-
-La instancia se ejecuta actualmente dentro de una única subnet pública:
-
-```text
-10.0.1.0/24
-```
-
-Terraform selecciona la primera Availability Zone disponible:
-
-```hcl
-availability_zone = data.aws_availability_zones.available.names[0]
-```
-
-La subnet tiene:
-
-```hcl
-map_public_ip_on_launch = true
-```
-
-Aunque EC2 recibe una IP pública al crearse, la dirección utilizada como entrada estable es la Elastic IP administrada por Terraform.
-
----
-
-## Route Table
-
-La tabla de rutas pública contiene:
-
-```text
-Destination: 0.0.0.0/0
-Target:      Internet Gateway
-```
-
-Esto permite salida y entrada de tráfico público para los recursos que cumplan también las reglas del Security Group.
-
----
-
-## Security Group
-
-El Security Group permite únicamente el tráfico público necesario para Nginx:
-
-| Dirección | Protocolo | Puerto | Origen/Destino | Uso |
-|---|---:|---:|---|---|
-| Inbound | TCP | `80` | `0.0.0.0/0` | HTTP + Let's Encrypt HTTP-01 |
-| Inbound | TCP | `443` | `0.0.0.0/0` | HTTPS |
-| Outbound | All | All | `0.0.0.0/0` | Salida de la instancia |
-
-No existen reglas públicas para:
-
-```text
-8080
-8081
-```
-
-Estos puertos pertenecen exclusivamente al tráfico interno entre contenedores.
-
----
-
-## IAM y Systems Manager
-
-La instancia utiliza un IAM Role dedicado:
-
-```text
-portfolio-ec2-role
-```
-
-Al rol se adjunta:
-
-```text
-AmazonSSMManagedInstanceCore
-```
-
-Después se crea un Instance Profile que es asociado a EC2.
-
-Esto permite administrar la instancia mediante **AWS Systems Manager Session Manager** sin necesidad de publicar el puerto SSH `22`.
-
-```mermaid
-flowchart LR
-    IAM[IAM Role] --> POLICY[AmazonSSMManagedInstanceCore]
-    IAM --> PROFILE[IAM Instance Profile]
-    PROFILE --> EC2[EC2]
-    SSM[AWS Systems Manager] --> EC2
-```
-
----
-
-## EC2
-
-La AMI de Amazon Linux 2023 no está codificada con un ID fijo.
-
-Terraform consulta AWS Systems Manager Parameter Store:
-
-```text
-/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-```
-
-De esta forma, una nueva creación utiliza una AMI actual de Amazon Linux 2023.
-
-### Configuración por defecto
-
-| Parámetro | Valor |
+| Environment key | Meaning |
 |---|---|
-| OS | Amazon Linux 2023 |
-| Instance type | `t3.small` |
-| Root volume | `20 GB` |
-| Volume type | `gp3` |
-| Encryption | Enabled |
-| Delete on termination | Enabled |
-| IMDS | Enabled |
-| IMDSv2 tokens | Required |
+| `SERVICES_OPGG_URL` | Base URL for the OP.GG-facing integration |
+| `SERVICES_HENRIKDEV_URL` | Base URL for the HenrikDev-facing integration |
+| `HENRIKDEV_API_KEY` | Credential used by the HenrikDev integration |
 
-El volumen raíz se cifra y se elimina junto con la instancia.
-
-La instancia también exige **IMDSv2**:
-
-```hcl
-metadata_options {
-  http_endpoint = "enabled"
-  http_tokens   = "required"
-}
-```
-
-### Ciclo de vida
-
-El recurso contiene:
-
-```hcl
-user_data_replace_on_change = true
-```
-
-Por lo tanto, los cambios relevantes en `scripts/user_data.sh` pueden provocar el reemplazo de la instancia, permitiendo reconstruir el entorno desde un bootstrap limpio.
-
-La AMI está incluida en:
-
-```hcl
-lifecycle {
-  ignore_changes = [ami]
-}
-```
-
-Esto evita reemplazar una instancia existente únicamente porque el parámetro de Amazon Linux haya avanzado a una AMI más nueva.
-
----
-
-## Elastic IP
-
-```hcl
-resource "aws_eip" "portfolio"
-```
-
-La EIP se asocia directamente a:
-
-```text
-aws_instance.portfolio
-```
-
-y depende del Internet Gateway.
-
-Su función es desacoplar el endpoint público del ciclo de vida normal de una IP pública dinámica de EC2.
-
-> Si se ejecuta un `terraform destroy` completo, la Elastic IP también será destruida. Un deployment posterior puede obtener otra dirección, por lo que el A record de No-IP deberá actualizarse.
-
----
-
-# Stack interno de la EC2
-
-La EC2 no ejecuta los backends directamente como procesos del sistema.
-
-El stack se ejecuta sobre:
-
-```text
-Amazon Linux 2023
-└── Docker Engine
-    └── Docker Compose
-        ├── nginx
-        ├── certbot
-        ├── portfolio-backend
-        └── language-service
-```
-
-## Contenedores
-
-| Servicio | Imagen | Puerto | Exposición |
-|---|---|---:|---|
-| Nginx | `nginx:alpine` | `80`, `443` | Pública |
-| Certbot | `certbot/certbot:latest` | — | Interna / ejecución puntual |
-| BFF | `hotdoctor/portfolio-backend:latest` | `8080` | Docker interno |
-| Language Service | `hotdoctor/portfolio-microservices-language_service:latest` | `8081` | Docker interno |
-
----
-
-# Redes Docker
-
-La arquitectura utiliza dos redes bridge.
+Actual values belong in the ignored local `terraform.tfvars`; they are intentionally not documented here.
 
 ```mermaid
 flowchart LR
-    INTERNET((Internet))
+    Client([Client]) --> Nginx[Nginx]
+    Nginx --> BFF[BFF]
+    BFF -->|LANGUAGE_SERVICE_URL| Language[language-service]
+    BFF -->|STATS_SERVICE_URL| Stats[stats-service]
+    Stats -->|HTTPS egress| OPGG[OP.GG integration]
+    Stats -->|HTTPS egress + API key| Henrik[HenrikDev integration]
 
-    subgraph EDGE["edge network"]
-        NGINX[Nginx]
-        BFF[BFF]
+    classDef public fill:#e8f1ff,stroke:#2563eb,color:#111827;
+    classDef private fill:#ecfdf5,stroke:#16a34a,color:#111827;
+    classDef external fill:#fff7ed,stroke:#f97316,color:#111827;
+    class Client,Nginx public;
+    class BFF,Language,Stats private;
+    class OPGG,Henrik external;
+```
+
+## Docker network isolation
+
+```mermaid
+flowchart TB
+    Internet((Internet))
+    subgraph Edge["edge bridge network"]
+        Nginx[Nginx]
+        BFFEdge["BFF<br/>same container"]
     end
-
-    subgraph INTERNAL["microservices network"]
-        BFF2[BFF]
-        LANG[Language Service]
+    subgraph Internal["microservices bridge network"]
+        BFFInternal["BFF<br/>same container"]
+        Language[language-service]
+        Stats[stats-service]
     end
+    Certbot["Certbot<br/>shared volumes"]
 
-    INTERNET -->|80 / 443| NGINX
-    NGINX -->|8080| BFF
-    BFF -. mismo contenedor .- BFF2
-    BFF2 -->|8081| LANG
+    Internet -->|80 / 443| Nginx
+    Nginx -->|8080| BFFEdge
+    BFFEdge -. dual-homed .- BFFInternal
+    BFFInternal -->|8081| Language
+    BFFInternal -->|8082| Stats
+    Certbot -. certificates .-> Nginx
 ```
 
-## `edge`
+| Network | Members | Security purpose |
+|---|---|---|
+| `edge` | Nginx, BFF | Lets the reverse proxy reach only the application gateway |
+| `microservices` | BFF, language service, stats service | Keeps domain services away from Nginx and public host ports |
 
-Conecta:
+This is container-level segmentation, not separate VM or VPC isolation. All containers still share one kernel and one EC2 failure domain.
 
-```text
-nginx
-bff
+## Configuration model
+
+Terraform no longer passes a static shell file directly to EC2. `ec2.tf` composes image names and calls `templatefile()` to render `scripts/user_data.sh` with deployment-specific values.
+
+```mermaid
+flowchart LR
+    Vars["terraform.tfvars<br/>local and ignored"] --> TFVars["variables.tf<br/>types + validation"]
+    TFVars --> Locals["ec2.tf locals<br/>build image references"]
+    Script["scripts/user_data.sh<br/>Terraform template"] --> Template[templatefile]
+    Locals --> Template
+    Template --> UserData["Rendered EC2 user_data"]
+    UserData --> Files["/opt/portfolio<br/>compose.yaml + nginx.conf"]
 ```
 
-Su propósito es permitir que Nginx alcance al BFF sin publicar `8080` en EC2.
+### Input variables
 
-## `microservices`
+| Variable | Type | Default | Consumed by |
+|---|---|---:|---|
+| `project_name` | `string` | `portfolio` | Resource names and AWS tags |
+| `aws_region` | `string` | `us-east-1` | AWS provider |
+| `instance_type` | `string` | `t3.small` | EC2 instance |
+| `root_volume_size` | `number` | `20` | Root volume size in GiB |
+| `dockerhub_username` | sensitive `string` | required | Namespace for all application images |
+| `bff_version` | `string` | required | BFF image tag |
+| `language_version` | `string` | required | Language image tag; currently also used by the stats image |
+| `stats_version` | `string` | required | Intended stats image tag; declared but currently unused |
+| `domain_name` | `string` | required | Nginx server name and Let's Encrypt certificate name |
+| `deployment_base_dir` | `string` | `/opt/portfolio` | Generated runtime files and Compose working directory |
+| `docker_compose_version` | `string` | `v5.1.4` | Docker Compose CLI plugin downloaded during bootstrap |
+| `bff_upstream_url` | `string` | required | Nginx upstream, normally `http://bff:8080` |
+| `bff_environment` | sensitive `map(string)` | required | BFF runtime configuration and internal service URLs |
+| `stats_environment` | sensitive `map(string)` | required | Stats provider URLs and credentials |
 
-Conecta:
+Validation currently checks Docker Hub namespace syntax, non-empty image tags, a fully qualified domain, an absolute non-root deployment path, semantic-looking Compose versions, a valid HTTP(S) BFF upstream, and valid non-empty environment variable maps.
 
-```text
-bff
-language-service
-```
+### Complete configuration shape
 
-Los microservicios quedan aislados del reverse proxy y del tráfico público.
-
-El BFF pertenece a ambas redes porque actúa como puente lógico entre la capa de entrada y la capa de servicios.
-
----
-
-# HTTPS y certificados
-
-La terminación TLS ocurre en **Nginx**.
-
-El backend no necesita gestionar certificados directamente.
-
-```text
-Client
-   │
-   │ HTTPS
-   ▼
-Nginx
-   │
-   │ HTTP dentro de Docker
-   ▼
-BFF
-```
-
-## Emisión inicial
-
-El bootstrap primero inicia Nginx únicamente por HTTP.
-
-Nginx expone:
-
-```text
-/.well-known/acme-challenge/
-```
-
-Certbot utiliza el método:
-
-```text
-HTTP-01 / webroot
-```
-
-y comparte con Nginx:
-
-```text
-./certbot/www
-./certbot/conf
-```
-
-Cuando Let's Encrypt entrega el certificado, Nginx pasa a utilizar:
-
-```text
-/etc/letsencrypt/live/api-portfolio.zapto.org/fullchain.pem
-/etc/letsencrypt/live/api-portfolio.zapto.org/privkey.pem
-```
-
-Después:
-
-```text
-HTTP :80  → 301 → HTTPS
-HTTPS :443 → BFF
-```
-
-## Renovación
-
-El bootstrap crea:
-
-```text
-portfolio-certbot-renew.service
-portfolio-certbot-renew.timer
-```
-
-El timer intenta la renovación dos veces al día:
-
-```text
-03:00
-15:00
-```
-
-con:
-
-```text
-RandomizedDelaySec=30m
-```
-
-Después de una ejecución de Certbot se valida y recarga Nginx.
-
----
-
-# Seguridad
-
-La arquitectura aplica varias medidas de reducción de superficie de ataque.
-
-### Solo 80 y 443 son públicos
-
-```text
-Internet
- ├── 80  → Nginx
- └── 443 → Nginx
-```
-
-Los servicios internos no publican sus puertos en EC2.
-
-### No se requiere SSH público
-
-No existe una regla inbound para:
-
-```text
-22/tcp
-```
-
-La administración se realiza mediante AWS Systems Manager.
-
-### IMDSv2 obligatorio
-
-EC2 exige tokens para consultar Instance Metadata Service.
-
-### Disco cifrado
-
-El root volume `gp3` está configurado con:
+The committed `terraform.tfvars.example` does not yet include the new stats fields. Until it is synchronized, use this complete shape as the reference and replace every placeholder locally:
 
 ```hcl
-encrypted = true
+project_name = "portfolio"
+aws_region   = "us-east-1"
+
+instance_type    = "t3.small"
+root_volume_size = 20
+
+dockerhub_username = "replace-me"
+bff_version       = "replace-me"
+language_version  = "replace-me"
+stats_version     = "replace-me"
+
+domain_name = "api.example.com"
+
+deployment_base_dir    = "/opt/portfolio"
+docker_compose_version = "v5.1.4"
+bff_upstream_url       = "http://bff:8080"
+
+bff_environment = {
+  LANGUAGE_SERVICE_URL = "http://language-service:8081"
+  STATS_SERVICE_URL    = "http://stats-service:8082"
+}
+
+stats_environment = {
+  SERVICES_OPGG_URL      = "replace-me"
+  SERVICES_HENRIKDEV_URL = "replace-me"
+  HENRIKDEV_API_KEY      = "replace-me"
+}
 ```
 
-### Segmentación de contenedores
+Do not commit the real `terraform.tfvars`.
 
-Nginx no comparte directamente la red `microservices`.
+## EC2 bootstrap
 
-```text
-Nginx
-  │ edge
-  ▼
- BFF
-  │ microservices
-  ▼
-Services
-```
-
-Esto mantiene el BFF como única puerta lógica hacia los microservicios.
-
-### Terraform state y variables
-
-`.gitignore` excluye:
-
-```text
-*.tfstate
-*.tfstate.*
-*.tfvars
-*.tfvars.json
-.terraform/
-```
-
-Los archivos con estado y valores potencialmente sensibles no deben versionarse.
-
----
-
-# Bootstrap con `user_data`
-
-Terraform entrega:
-
-```text
-scripts/user_data.sh
-```
-
-a EC2 mediante:
-
-```hcl
-user_data = file("${path.module}/scripts/user_data.sh")
-```
-
-El script se ejecuta a través de cloud-init durante el primer arranque.
-
-## Secuencia
+The rendered `user_data` runs through cloud-init on a new instance. `set -euxo pipefail` stops the bootstrap at the first failing command and prints commands to the cloud-init log.
 
 ```mermaid
 flowchart TD
-    START[EC2 starts] --> UPDATE[dnf update]
-    UPDATE --> INSTALL[Install Docker / Git / OpenSSL]
-    INSTALL --> DOCKER[Enable Docker]
-    DOCKER --> SSM[Enable SSM Agent]
-    SSM --> COMPOSE[Install Docker Compose]
-    COMPOSE --> FILES[Create nginx.conf + compose.yaml]
-    FILES --> PULL[Pull Docker images]
-    PULL --> UP[Start Nginx + BFF + Language Service]
-    UP --> TESTHTTP[Test Nginx HTTP]
-    TESTHTTP --> CERT[Request Let's Encrypt certificate]
-    CERT --> HTTPS[Write final HTTPS config]
-    HTTPS --> RELOAD[Validate and reload Nginx]
-    RELOAD --> TIMER[Enable certificate renewal timer]
+    Start([EC2 first boot]) --> Update[dnf update]
+    Update --> Packages["Install Docker, Git, OpenSSL"]
+    Packages --> Docker["Enable and start Docker"]
+    Docker --> SSM["Enable and start SSM agent"]
+    SSM --> Compose["Download configured Docker Compose plugin"]
+    Compose --> Directories["Create Nginx and Certbot directories"]
+    Directories --> HTTPConfig["Write temporary HTTP nginx.conf"]
+    HTTPConfig --> ComposeFile["Write compose.yaml with 5 services"]
+    ComposeFile --> Pull["Pull all container images"]
+    Pull --> Up["Start Nginx, BFF, language, stats"]
+    Up --> NginxTest["Validate Nginx and local ACME path"]
+    NginxTest --> Certificate{"Certificate already exists?"}
+    Certificate -->|No| Issue["Run Certbot HTTP-01"]
+    Certificate -->|Yes| TLSConfig
+    Issue --> TLSConfig["Write final HTTP + HTTPS nginx.conf"]
+    TLSConfig --> Reload["Validate and reload Nginx"]
+    Reload --> Smoke["Local HTTPS smoke test"]
+    Smoke --> Units["Create renewal service and timer"]
+    Units --> Done["Show Compose and timer status"]
 ```
 
-El script utiliza:
-
-```bash
-set -euxo pipefail
-```
-
-por lo que un error durante el bootstrap detiene la ejecución. Esto evita continuar silenciosamente con una instalación incompleta.
-
----
-
-# Estructura del repositorio
+The resulting host layout is:
 
 ```text
-portfolio-arq-terraform/
-│
+/opt/portfolio/                         # configurable through deployment_base_dir
+├── compose.yaml                        # generated; do not edit as source of truth
+├── nginx/
+│   └── nginx.conf                      # generated twice: HTTP bootstrap, then HTTPS
+└── certbot/
+    ├── conf/                           # Let's Encrypt account and certificates
+    └── www/.well-known/acme-challenge/ # HTTP-01 webroot
+```
+
+Because `user_data_replace_on_change = true`, a rendered bootstrap change can cause Terraform to replace the EC2 instance. Always inspect the plan before applying a configuration or template change.
+
+## TLS lifecycle
+
+```mermaid
+sequenceDiagram
+    participant U as user_data.sh
+    participant N as Nginx
+    participant C as Certbot
+    participant L as Let's Encrypt
+    participant T as systemd timer
+
+    U->>N: Start temporary HTTP configuration
+    U->>N: Verify local ACME webroot
+    U->>C: certonly --webroot --domain DOMAIN
+    C->>L: Request certificate
+    L->>N: HTTP-01 challenge on port 80
+    N-->>L: Serve challenge file
+    L-->>C: Issue certificate
+    C-->>U: Store files in certbot/conf
+    U->>N: Install HTTPS configuration and reload
+    U->>T: Enable renewal timer
+    loop 03:00 and 15:00, with randomized delay
+        T->>C: certbot renew --quiet
+        T->>N: nginx -t and reload
+    end
+```
+
+Nginx reads:
+
+```text
+/etc/letsencrypt/live/<domain_name>/fullchain.pem
+/etc/letsencrypt/live/<domain_name>/privkey.pem
+```
+
+These paths are backed by the host's `certbot/conf` directory. The persistent timer checks twice daily at `03:00` and `15:00`, with up to 30 minutes of randomized delay.
+
+The initial request uses `--register-unsafely-without-email`; no certificate-expiration email address is registered by this bootstrap.
+
+## Security model
+
+```mermaid
+flowchart LR
+    subgraph Public["Public trust boundary"]
+        Internet((Internet))
+        Ports["Security Group<br/>TCP 80 / 443"]
+        Nginx[Nginx]
+    end
+    subgraph Edge["Edge container boundary"]
+        BFF[BFF]
+    end
+    subgraph Private["Private container boundary"]
+        Language[language-service]
+        Stats[stats-service]
+    end
+    subgraph Management["AWS management plane"]
+        Operator[Authorized operator]
+        SSM[Systems Manager]
+        Role[EC2 IAM role]
+        HostAccess[EC2 managed session]
+    end
+
+    Internet --> Ports --> Nginx --> BFF
+    BFF --> Language
+    BFF --> Stats
+    Operator --> SSM --> HostAccess
+    Role --> HostAccess
+    HostAccess -. operates containers .-> BFF
+```
+
+### Implemented controls
+
+- Only TCP `80` and `443` are permitted inbound from `0.0.0.0/0`.
+- There is no inbound rule for SSH `22`, no configured EC2 key pair, and no public application port `8080`, `8081`, or `8082`.
+- Systems Manager Session Manager provides host administration through an EC2 IAM role.
+- IMDSv2 tokens are mandatory.
+- The root EBS volume is encrypted.
+- Nginx terminates TLS and permits TLS `1.2` and `1.3`.
+- The BFF is the only container attached to both application networks.
+- `terraform.tfvars`, state files, and `.terraform/` are ignored by Git.
+
+### Secret handling boundary
+
+Marking `bff_environment` and `stats_environment` as Terraform `sensitive` hides values from normal CLI output, but it does not encrypt them. Their rendered values can still exist in Terraform state, EC2 user data, cloud-init artifacts, and the generated Compose file on disk.
+
+For stronger production handling, store credentials in AWS Secrets Manager or SSM Parameter Store, grant the instance narrowly scoped read access, and retrieve them at runtime instead of interpolating them into `user_data`.
+
+## Repository layout
+
+```text
+.
 ├── .gitignore
 ├── .terraform.lock.hcl
-│
-├── provider.tf
-├── versions.tf
-├── variables.tf
-├── outputs.tf
-│
-├── network.tf
-├── security.tf
-├── iam.tf
-├── ec2.tf
-├── elastic_ip-.tf
-│
-└── scripts/
-    └── user_data.sh
+├── README.md
+├── docs/
+│   ├── architecture.png        # original single-microservice diagram
+│   └── architecture-v2.png     # current diagram with stats-service
+├── ec2.tf                      # AMI lookup, image locals, user_data, EC2
+├── elastic_ip-.tf              # Elastic IP and EC2 association
+├── iam.tf                      # EC2 role, SSM policy, instance profile
+├── network.tf                  # VPC, subnet, IGW, route table
+├── outputs.tf                  # instance and address outputs
+├── provider.tf                 # AWS provider and default tags
+├── scripts/
+│   └── user_data.sh            # Terraform-rendered host bootstrap
+├── security.tf                 # Security Group and rules
+├── terraform.tfvars.example    # public template; currently incomplete for stats
+├── variables.tf                # input declarations and validation
+└── versions.tf                 # Terraform and provider constraints
 ```
 
-## Responsabilidad de cada archivo
+Local `.terraform/`, `terraform.tfvars`, `terraform.tfstate`, and backup state files are intentionally omitted from the documented source tree and must remain uncommitted.
 
-| Archivo | Responsabilidad |
-|---|---|
-| `versions.tf` | Versión mínima de Terraform y provider AWS |
-| `provider.tf` | Región y tags globales |
-| `variables.tf` | Parámetros configurables |
-| `network.tf` | VPC, subnet, Internet Gateway y route table |
-| `security.tf` | Security Group y reglas 80/443 |
-| `iam.tf` | IAM Role, policy attachment e Instance Profile |
-| `ec2.tf` | AMI, EC2, storage, metadata y user data |
-| `elastic_ip-.tf` | Elastic IP asociada a EC2 |
-| `outputs.tf` | IDs, IPs y endpoint de salida |
-| `scripts/user_data.sh` | Bootstrap del runtime Docker/Nginx/Certbot |
-| `.gitignore` | Evita versionar state, tfvars y archivos locales |
+## Requirements
 
----
-
-# Requisitos
-
-## Locales
+### Local tooling
 
 - Terraform `>= 1.10.0`
-- AWS CLI configurado
-- Credenciales AWS válidas o AWS IAM Identity Center/SSO
-- Acceso suficiente para crear VPC, EC2, EIP, IAM, Security Groups y recursos relacionados
+- AWS CLI for authentication and operational commands
+- An AWS identity allowed to manage VPC, EC2, Elastic IP, IAM, Security Group, and related resources
+- Git for version control
 
-El provider está fijado actualmente a:
+Docker is not required on the workstation that runs Terraform. It is installed on EC2 by cloud-init.
 
-```text
-hashicorp/aws 6.60.0
-```
+### External dependencies
 
-Docker **no** es un requisito en la máquina desde la que se ejecuta Terraform; Docker se instala dentro de EC2 mediante `user_data.sh`.
+- A Docker Hub namespace containing the BFF, language, and stats images
+- The No-IP hostname, or another DNS hostname supplied through `domain_name`
+- DNS control for the hostname's A record
+- Public access from EC2 to GitHub Releases, Docker Hub, Let's Encrypt, OS repositories, and the stats providers
 
-## Externo
+The DNS record is not managed by Terraform.
 
-Debe existir el hostname:
+## Configure and deploy
 
-```text
-api-portfolio.zapto.org
-```
+### 1. Authenticate with AWS
 
-con un A record apuntando a la Elastic IP.
-
-Este DNS actualmente **no está administrado por Terraform**.
-
----
-
-# Autenticación con AWS
-
-Terraform utiliza la credential chain estándar de AWS.
-
-Un flujo recomendado con IAM Identity Center es:
+Terraform uses the standard AWS credential chain. With IAM Identity Center:
 
 ```bash
 aws sso login --profile terraform
 ```
 
-### PowerShell
+PowerShell:
 
 ```powershell
-$env:AWS_PROFILE="terraform"
-```
-
-### Bash
-
-```bash
-export AWS_PROFILE=terraform
-```
-
-Verificación:
-
-```bash
+$env:AWS_PROFILE = "terraform"
 aws sts get-caller-identity
 ```
 
-No es necesario almacenar Access Keys dentro de los archivos `.tf`.
+Bash:
 
----
+```bash
+export AWS_PROFILE=terraform
+aws sts get-caller-identity
+```
 
-# Despliegue
+Do not place access keys in `.tf` or `.tfvars` files.
 
-## 1. Inicializar
+### 2. Create local configuration
+
+```powershell
+Copy-Item terraform.tfvars.example terraform.tfvars
+```
+
+Then add the missing `stats_version`, `STATS_SERVICE_URL`, and `stats_environment` entries shown in [Complete configuration shape](#complete-configuration-shape), and replace all placeholders.
+
+### 3. Initialize and validate
 
 ```bash
 terraform init
-```
-
-## 2. Formatear
-
-```bash
 terraform fmt -recursive
-```
-
-## 3. Validar
-
-```bash
 terraform validate
 ```
 
-## 4. Revisar el plan
+### 4. Review and apply
 
 ```bash
 terraform plan
-```
-
-## 5. Aplicar
-
-```bash
 terraform apply
 ```
 
-## 6. Consultar outputs
+Inspect resource replacements carefully. A change in rendered `user_data` is expected to replace EC2.
 
-```bash
-terraform output
-```
-
-Ejemplo:
+### 5. Point DNS to the Elastic IP
 
 ```bash
 terraform output -raw public_ip
-```
-
-## 7. DNS
-
-Verifica que:
-
-```text
-api-portfolio.zapto.org
-```
-
-resuelva a la misma IP mostrada por:
-
-```bash
-terraform output -raw public_ip
-```
-
-Puedes comprobarlo con:
-
-```bash
 nslookup api-portfolio.zapto.org
 ```
 
-## 8. Endpoint
+The hostname must resolve to the Elastic IP before Let's Encrypt can complete HTTP-01 validation.
 
-La URL de aplicación configurada es:
-
-```text
-https://api-portfolio.zapto.org
+```mermaid
+flowchart LR
+    Init[terraform init] --> Validate[fmt + validate]
+    Validate --> Plan[terraform plan]
+    Plan --> Apply[terraform apply]
+    Apply --> EIP[Read public_ip]
+    EIP --> DNS[Update / verify A record]
+    DNS --> ACME[Let's Encrypt HTTP-01]
+    ACME --> HTTPS[Verify HTTPS endpoint]
 ```
 
----
+> Fresh-deployment caveat: cloud-init can reach Certbot before an externally managed DNS record has been updated to a newly allocated EIP. If issuance fails, update DNS, wait for propagation, inspect cloud-init, and then deliberately recreate or rerun the failed bootstrap. A future design should allocate/manage DNS before certificate issuance.
 
-# Variables
-
-| Variable | Default | Uso actual |
-|---|---|---|
-| `project_name` | `portfolio` | Nombres y tags |
-| `aws_region` | `us-east-1` | Provider AWS |
-| `instance_type` | `t3.small` | EC2 |
-| `root_volume_size` | `20` | Root volume |
-| `dockerhub_username` | sin default | Declarada; no consumida actualmente por `user_data.sh` |
-| `bff_version` | `latest` | Declarada; imagen actual está hardcodeada a `latest` |
-| `language_version` | `latest` | Declarada; imagen actual está hardcodeada a `latest` |
-| `domain_name` | `_` | Declarada; el dominio está hardcodeado en `user_data.sh` |
-
-> Las últimas cuatro variables muestran una oportunidad clara de refactor: pasar valores desde Terraform hacia `user_data.sh` mediante `templatefile()` o variables de entorno generadas por Terraform.
-
----
-
-# Outputs
-
-Terraform expone:
-
-| Output | Contenido |
-|---|---|
-| `instance_id` | ID de EC2 |
-| `public_ip` | Elastic IP |
-| `private_ip` | IP privada de EC2 |
-| `https_url` | URL construida actualmente con la Elastic IP |
-
-Ejemplo:
+### 6. Verify the public endpoint
 
 ```bash
-terraform output instance_id
-terraform output public_ip
-terraform output private_ip
-terraform output https_url
+curl -I http://api-portfolio.zapto.org
+curl -v https://api-portfolio.zapto.org/
 ```
 
-> **Importante:** el certificado TLS se emite para `api-portfolio.zapto.org`, no para la dirección IP. Para tráfico HTTPS real debe preferirse `https://api-portfolio.zapto.org`. El output `https_url` actual utiliza la EIP y sería conveniente cambiarlo en el futuro para devolver el dominio.
+HTTP should redirect to HTTPS. Use the hostname—not the raw IP—for TLS verification.
 
----
+## Outputs
 
-# Operación y diagnóstico
+| Output | Value |
+|---|---|
+| `instance_id` | EC2 instance ID |
+| `public_ip` | Associated Elastic IP |
+| `private_ip` | EC2 private IPv4 address |
+| `https_url` | `https://<elastic-ip>` in the current code |
 
-## Estado de cloud-init
+```bash
+terraform output
+terraform output -raw instance_id
+terraform output -raw public_ip
+terraform output -raw private_ip
+terraform output -raw https_url
+```
+
+The current `https_url` output is not the canonical application URL: the Let's Encrypt certificate is issued to `domain_name`, not the IP address. Prefer `https://api-portfolio.zapto.org`.
+
+## Operations runbook
+
+### Start a Session Manager shell
+
+```bash
+aws ssm start-session --target "$(terraform output -raw instance_id)"
+```
+
+PowerShell:
+
+```powershell
+$instanceId = terraform output -raw instance_id
+aws ssm start-session --target $instanceId
+```
+
+### Check cloud-init
 
 ```bash
 sudo cloud-init status --long
+sudo tail -n 200 /var/log/cloud-init-output.log
 ```
 
-Esperado:
-
-```text
-status: done
-```
-
-Logs:
+### Check containers and logs
 
 ```bash
-sudo tail -f /var/log/cloud-init-output.log
+cd /opt/portfolio
+sudo docker compose ps
+sudo docker compose logs --tail=200 nginx
+sudo docker compose logs --tail=200 bff
+sudo docker compose logs --tail=200 language-service
+sudo docker compose logs --tail=200 stats-service
 ```
 
-Si el bootstrap falla, este es el primer lugar que debe revisarse.
+If `deployment_base_dir` was customized, use that path instead. Add `--follow` to stream logs.
 
----
-
-## Contenedores
+### Validate Nginx and the internal services
 
 ```bash
-sudo docker compose \
-  -f /opt/portfolio/compose.yaml \
-  ps
+cd /opt/portfolio
+sudo docker compose exec -T nginx nginx -t
+sudo docker compose exec -T nginx wget -qO- http://bff:8080/
 ```
 
----
-
-## Validar Nginx
+If the BFF image contains `wget`, test Docker service discovery from its network namespace:
 
 ```bash
-sudo docker compose \
-  -f /opt/portfolio/compose.yaml \
-  exec nginx nginx -t
+sudo docker compose exec -T bff wget -qO- http://language-service:8081/
+sudo docker compose exec -T bff wget -qO- http://stats-service:8082/
 ```
 
----
-
-## Logs de Nginx
+### Check host ports
 
 ```bash
-sudo docker compose \
-  -f /opt/portfolio/compose.yaml \
-  logs nginx
+sudo ss -lntp
 ```
 
----
+Only Nginx should publish application ports `80` and `443` on the host.
 
-## Validar puertos
+### Inspect certificates and renewal
 
 ```bash
-sudo ss -lntp | grep -E ':80|:443'
+cd /opt/portfolio
+sudo docker compose run --rm certbot certificates
+sudo docker compose run --rm certbot renew --dry-run
+sudo systemctl status portfolio-certbot-renew.timer --no-pager
+sudo systemctl list-timers portfolio-certbot-renew.timer --all
 ```
 
----
-
-## Probar HTTPS
+### Reload Nginx safely
 
 ```bash
-curl -v https://api-portfolio.zapto.org
+cd /opt/portfolio
+sudo docker compose exec -T nginx nginx -t && \
+sudo docker compose exec -T nginx nginx -s reload
 ```
 
----
+## Troubleshooting
 
-## Certificados
-
-```bash
-sudo ls -la \
-  /opt/portfolio/certbot/conf/live/api-portfolio.zapto.org/
+```mermaid
+flowchart TD
+    Failure["Endpoint unavailable"] --> DNS{"DNS returns the EIP?"}
+    DNS -->|No| FixDNS["Fix A record and wait for propagation"]
+    DNS -->|Yes| SG{"80 / 443 reachable?"}
+    SG -->|No| CheckAWS["Check EIP association, route table, SG"]
+    SG -->|Yes| Init{"cloud-init succeeded?"}
+    Init -->|No| CloudLog["Read cloud-init-output.log"]
+    Init -->|Yes| Nginx{"Nginx healthy?"}
+    Nginx -->|No| NginxLogs["nginx -t and container logs"]
+    Nginx -->|Yes| BFF{"BFF responds internally?"}
+    BFF -->|No| BFFLogs["Check BFF logs and bff_environment"]
+    BFF -->|Yes| Service{"Which capability fails?"}
+    Service -->|Language| LangLogs["Check language-service logs and URL"]
+    Service -->|Stats| StatsLogs["Check stats logs, URLs, API key, egress"]
 ```
 
----
+### Certificate request fails
 
-## Timer de renovación
+- Confirm `domain_name` resolves publicly to `terraform output -raw public_ip`.
+- Confirm TCP `80` is reachable and temporary Nginx is running.
+- Confirm `/.well-known/acme-challenge/` is served from the shared webroot.
+- Avoid repeated recreation that could trigger Let's Encrypt rate limits.
 
-```bash
-sudo systemctl status portfolio-certbot-renew.timer
+### Nginx returns `502 Bad Gateway`
+
+- Confirm `bff` is running with `docker compose ps`.
+- Read `docker compose logs bff nginx`.
+- Verify `bff_upstream_url`, normally `http://bff:8080`.
+- Confirm Nginx and BFF share `edge` and the application listens on `8080`.
+
+### Language or stats requests fail
+
+- Confirm the requested service is running.
+- Check `LANGUAGE_SERVICE_URL` or `STATS_SERVICE_URL` in the BFF environment.
+- Confirm the BFF and service share `microservices`.
+- For stats, verify outbound Internet access and provider configuration without printing secrets.
+
+### Session Manager cannot connect
+
+- Confirm the instance is running and its instance profile is attached.
+- Confirm `amazon-ssm-agent` is active.
+- Confirm outbound connectivity to SSM endpoints through the Internet Gateway.
+- Confirm the operator's AWS identity has Session Manager permissions.
+
+## How changes are delivered
+
+```mermaid
+flowchart TD
+    Change{"What changed?"}
+    Change -->|AWS resource arguments| PlanAWS[Terraform plans update or replacement]
+    Change -->|Image tag / env / domain / script| Render[Rendered user_data changes]
+    Render --> Replace[EC2 replacement because user_data_replace_on_change is true]
+    Change -->|Only external DNS| DNSOnly[No Terraform-managed DNS change]
+    PlanAWS --> Review[Review terraform plan]
+    Replace --> Review
+    DNSOnly --> Verify[Verify DNS and TLS manually]
+    Review --> Apply[terraform apply]
+    Apply --> Bootstrap[New instance bootstraps the complete stack]
 ```
 
-Listado:
+Application image upgrades are currently infrastructure deployments: changing a tag changes rendered `user_data`, which can replace the host. There is no separate CI/CD pipeline that runs `docker compose pull` on an existing instance.
 
-```bash
-sudo systemctl list-timers
-```
+Before replacing the host, account for certificate data on the root volume, EIP reassociation, DNS and ACME timing, bootstrap downtime, and any data written only to a container or the instance filesystem.
 
----
+## Current implementation notes
 
-## Acceso mediante SSM
+These points describe the code exactly as it exists now and should be resolved before treating the stack as fully repeatable production infrastructure.
 
-Obtén el ID:
+1. **The stats image tag is miswired.** `local.stats_image` uses `var.language_version`; `var.stats_version` is required and validated but unused.
+2. **The public example is incomplete.** `terraform.tfvars.example` lacks `stats_version`, `STATS_SERVICE_URL`, and `stats_environment`, so copying it unchanged cannot satisfy all required variables.
+3. **The HTTPS output uses the IP.** `https_url` should use `var.domain_name` to match the certificate.
+4. **Initial DNS and ACME ordering is fragile.** DNS is external, while issuance runs during the first boot of the resource receiving the EIP.
+5. **Sensitive values are rendered into user data.** Terraform's `sensitive` flag redacts display but does not provide secret storage.
+6. **The state backend is local.** No remote backend, state locking, or managed state-encryption policy is declared.
+7. **The generated architecture PNG is illustrative.** Mermaid diagrams and Terraform source are authoritative for exact CIDRs and dependencies.
 
-```bash
-terraform output -raw instance_id
-```
+`terraform validate` succeeds for the current configuration. A recursive formatting check reports the ignored local `terraform.tfvars`; this README update intentionally does not rewrite private local values.
 
-y abre una sesión:
+## Limitations and roadmap
 
-```bash
-aws ssm start-session --target <INSTANCE_ID>
-```
+### Current limitations
 
----
+- Single EC2 instance and single Availability Zone
+- No load balancer, Auto Scaling, rolling deployment, or zero-downtime replacement
+- No container health checks; `depends_on` controls start order, not readiness
+- No managed database, cache, queue, or persistent application volume
+- No centralized logs, metrics, tracing, dashboards, or alerting
+- No WAF or application rate limiting
+- No automated DNS resource
+- No remote Terraform backend or CI validation pipeline
+- Unpinned `nginx:alpine` and `certbot/certbot:latest` images
+- Docker Compose download is not checksum-verified
+- Broad Security Group egress
+- Certificate account registered without an email address
+- Root volume and certificate data deleted with the instance
 
-# Decisiones de diseño
+### Suggested evolution
 
-## ¿Por qué Nginx?
+- [ ] Wire `stats_version` into `local.stats_image` and complete `terraform.tfvars.example`
+- [ ] Change `https_url` to use `domain_name`
+- [ ] Move secrets to Secrets Manager or SSM Parameter Store
+- [ ] Add container health checks and dependency readiness checks
+- [ ] Pin images to immutable versions or digests
+- [ ] Verify the Docker Compose download checksum
+- [ ] Move state to a remote encrypted backend with locking
+- [ ] Manage DNS in Terraform or separate EIP allocation from bootstrap
+- [ ] Add CI for formatting, validation, linting, and security scanning
+- [ ] Add CloudWatch logs, metrics, alarms, and health endpoints
+- [ ] Add backups or external persistence where required
+- [ ] Add an ALB and multiple instances when availability warrants it
+- [ ] Consider ECS or another orchestrator only when the trade-off is justified
 
-Nginx concentra las responsabilidades de infraestructura HTTP:
+## Design decisions
 
-- punto de entrada público;
-- reverse proxy;
-- TLS termination;
-- redirección HTTP → HTTPS;
-- exposición del challenge ACME;
-- separación entre Internet y el BFF.
+### Why one EC2 instance?
 
-El backend puede mantenerse enfocado en lógica de aplicación.
+It keeps cost and operational complexity appropriate for a portfolio while still demonstrating infrastructure as code, network boundaries, TLS, IAM-based administration, and container isolation. The trade-off is one host and one failure domain.
 
----
+### Why Nginx?
 
-## ¿Por qué un BFF?
+Nginx provides one public entry point, central TLS termination, an ACME webroot, HTTP-to-HTTPS redirection, and a stable reverse-proxy boundary.
 
-El BFF evita exponer directamente cada microservicio.
+### Why a BFF?
 
-```text
-Internet
-   │
-   ▼
- Nginx
-   │
-   ▼
-  BFF
-   │
-   ├── Language Service
-   ├── Future Service A
-   └── Future Service B
-```
+The BFF prevents clients from coupling directly to each microservice. It owns the public application surface, centralizes aggregation, and keeps internal services private.
 
-Esto permite centralizar en el futuro:
+### Why two Docker networks?
 
-- autenticación;
-- autorización;
-- composición de respuestas;
-- manejo de errores;
-- políticas comunes;
-- routing de aplicación.
+`edge` determines which container may receive traffic from Nginx. `microservices` determines which containers may participate in domain calls. The BFF is the only application component that needs both.
 
----
+### Why Systems Manager instead of SSH?
 
-## ¿Por qué dos redes Docker?
+Session Manager avoids a public SSH port, a bastion host, and EC2 key-pair distribution. AWS IAM controls access.
 
-`edge` y `microservices` separan responsabilidades.
+### Why an Elastic IP?
 
-```text
-edge:
-Nginx ↔ BFF
+The external A record needs a stable address. The EIP decouples it from the instance's ordinary public IPv4 lifecycle, although `terraform destroy` also releases it.
 
-microservices:
-BFF ↔ servicios internos
-```
+### Why `templatefile()`?
 
-Nginx no necesita acceso directo a cada microservicio.
+It keeps image versions, URLs, domain settings, and environment maps in Terraform's configuration model while preserving a readable shell bootstrap. The cost is that configuration changes become EC2 lifecycle changes and sensitive values flow through state and user data.
 
----
+## Author
 
-## ¿Por qué Systems Manager?
-
-SSM elimina la necesidad de abrir SSH al mundo.
-
-La administración queda separada del tráfico de aplicación y controlada mediante IAM.
-
----
-
-## ¿Por qué Elastic IP?
-
-La IP pública automática de EC2 no debe ser el identificador estable del backend.
-
-La EIP proporciona un endpoint IPv4 estable para el A record de No-IP mientras el recurso exista.
-
----
-
-# Limitaciones actuales
-
-Esta arquitectura es deliberadamente simple y está pensada como una infraestructura de portafolio / single-node.
-
-Actualmente **no** incluye:
-
-- alta disponibilidad;
-- múltiples Availability Zones;
-- Auto Scaling;
-- Application Load Balancer;
-- ECS/EKS;
-- subnet privada para workloads;
-- NAT Gateway;
-- WAF;
-- CloudFront;
-- observabilidad centralizada;
-- health checks de Docker Compose;
-- gestión automática de No-IP desde Terraform;
-- backend remoto para Terraform state.
-
-También existen algunos detalles de implementación que pueden refactorizarse:
-
-1. El dominio está hardcodeado en `user_data.sh`.
-2. Las imágenes Docker usan `latest` de forma directa.
-3. `dockerhub_username`, `bff_version`, `language_version` y `domain_name` no están conectadas al bootstrap.
-4. `https_url` utiliza la EIP en vez del hostname TLS.
-5. Un `terraform destroy` completo elimina la EIP; el A record externo deberá actualizarse si la IP cambia.
-6. La emisión inicial de Let's Encrypt depende de que No-IP ya resuelva correctamente hacia la EIP.
-
-Estas limitaciones son aceptables para el objetivo actual, pero marcan claramente el camino de evolución hacia una arquitectura distribuida.
-
----
-
-# Mejoras futuras
-
-Una evolución natural del proyecto podría incluir:
-
-- [ ] parametrizar dominio e imágenes Docker desde Terraform;
-- [ ] fijar versiones de imágenes en lugar de depender de `latest`;
-- [ ] mover Terraform state a un backend remoto;
-- [ ] automatizar el DNS o migrarlo a Route 53;
-- [ ] incorporar health checks a los contenedores;
-- [ ] añadir logs y métricas centralizadas;
-- [ ] integrar CI/CD;
-- [ ] añadir más microservicios a la red `microservices`;
-- [ ] evolucionar de una única EC2 hacia ECS/Fargate o una arquitectura con Load Balancer;
-- [ ] distribuir workloads entre múltiples Availability Zones;
-- [ ] añadir gestión de secretos mediante AWS Secrets Manager o SSM Parameter Store.
-
----
-
-# Resumen
-
-La arquitectura actual implementa un pipeline completo desde Internet hasta los microservicios internos:
-
-```text
-No-IP DNS
-    │
-    ▼
-Elastic IP
-    │
-    ▼
-AWS VPC
-    │
-    ▼
-Public Subnet
-    │
-    ▼
-Security Group
-    │
-    ▼
-Amazon EC2
-    │
-    ▼
-Docker Engine
-    │
-    ▼
-Nginx :443
-    │
-    ▼
-BFF :8080
-    │
-    ▼
-Microservices :8081+
-```
-
-Terraform es responsable de la infraestructura AWS; `user_data.sh` convierte la EC2 recién creada en el runtime de la aplicación; Docker Compose mantiene los servicios; Nginx controla la entrada pública; Certbot administra TLS; SSM permite operar la instancia sin SSH público; y el BFF mantiene a los microservicios aislados de Internet.
+**HotDoctor**<br>
+Full Stack Developer and aspiring DevOps Engineer<br>
+Esmeraldas, Ecuador<br>
+arevalobernaljuan@gmail.com
 
 ---
 
 <p align="center">
-  <strong>Terraform · AWS · Docker · Nginx · Let's Encrypt · Microservices</strong>
+  <strong>Terraform · AWS · Docker Compose · Nginx · Let's Encrypt · BFF · Microservices</strong>
 </p>
-
----
-
-# Author
-
-**Juan Arévalo**  
-Full Stack Developer & Future Desarrollador DevOps :P  
-📍 Esmeraldas, Ecuador  
-✉️ arevalobernaljuan@gmail.com
-

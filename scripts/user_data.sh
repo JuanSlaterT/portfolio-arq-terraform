@@ -2,8 +2,8 @@
 
 set -euxo pipefail
 
-DOMAIN="api-portfolio.zapto.org"
-BASE_DIR="/opt/portfolio"
+DOMAIN=${domain_name_shell}
+BASE_DIR=${base_dir}
 
 dnf update -y
 
@@ -23,7 +23,7 @@ systemctl start amazon-ssm-agent
 mkdir -p /usr/local/lib/docker/cli-plugins
 
 curl -fSL \
-    https://github.com/docker/compose/releases/download/v5.1.4/docker-compose-linux-x86_64 \
+    https://github.com/docker/compose/releases/download/${docker_compose_version}/docker-compose-linux-x86_64 \
     -o /usr/local/lib/docker/cli-plugins/docker-compose
 
 chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
@@ -38,14 +38,14 @@ cat > "$BASE_DIR/nginx/nginx.conf" <<'EOF'
 server {
     listen 80;
 
-    server_name api-portfolio.zapto.org;
+    server_name ${domain_name};
 
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
 
     location / {
-        proxy_pass http://bff:8080;
+        proxy_pass ${bff_upstream_url};
 
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -88,20 +88,32 @@ services:
       - ./certbot/conf:/etc/letsencrypt
 
   bff:
-    image: hotdoctor/portfolio-backend:latest
+    image: ${bff_image}
     restart: unless-stopped
 
     environment:
-      LANGUAGE_SERVICE_URL: http://language-service:8081
+%{ for name, value in bff_environment ~}
+      ${jsonencode(name)}: ${jsonencode(value)}
+%{ endfor ~}
 
     networks:
       - edge
       - microservices
 
   language-service:
-    image: hotdoctor/portfolio-microservices-language_service:latest
+    image: ${language_image}
     restart: unless-stopped
 
+    networks:
+      - microservices
+
+  stats-service:
+    image: ${stats_image}
+    restart: unless-stopped
+    environment:
+%{ for name, value in stats_environment ~}
+      ${jsonencode(name)}: ${jsonencode(value)}
+%{ endfor ~}
     networks:
       - microservices
 
@@ -118,9 +130,9 @@ chown -R ec2-user:ec2-user "$BASE_DIR"
 
 cd "$BASE_DIR"
 
-docker compose pull nginx bff language-service certbot
+docker compose pull nginx bff language-service stats-service certbot
 
-docker compose up -d nginx bff language-service
+docker compose up -d nginx bff language-service stats-service
 
 sleep 5
 
@@ -153,7 +165,7 @@ cat > "$BASE_DIR/nginx/nginx.conf" <<'EOF'
 server {
     listen 80;
 
-    server_name api-portfolio.zapto.org;
+    server_name ${domain_name};
 
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -167,15 +179,15 @@ server {
 server {
     listen 443 ssl;
 
-    server_name api-portfolio.zapto.org;
+    server_name ${domain_name};
 
-    ssl_certificate /etc/letsencrypt/live/api-portfolio.zapto.org/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/api-portfolio.zapto.org/privkey.pem;
+    ssl_certificate "/etc/letsencrypt/live/${domain_name}/fullchain.pem";
+    ssl_certificate_key "/etc/letsencrypt/live/${domain_name}/privkey.pem";
 
     ssl_protocols TLSv1.2 TLSv1.3;
 
     location / {
-        proxy_pass http://bff:8080;
+        proxy_pass ${bff_upstream_url};
 
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -203,7 +215,7 @@ After=docker.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/portfolio
+WorkingDirectory=${base_dir}
 ExecStart=/usr/bin/docker compose run --rm certbot renew --quiet
 ExecStartPost=/usr/bin/docker compose exec -T nginx nginx -t
 ExecStartPost=/usr/bin/docker compose exec -T nginx nginx -s reload

@@ -1,6 +1,26 @@
 data "aws_ssm_parameter" "amazon_linux_2023" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 }
+
+locals {
+  bff_image      = "${var.dockerhub_username}/portfolio-backend:${var.bff_version}"
+  language_image = "${var.dockerhub_username}/portfolio-microservices-language_service:${var.language_version}"
+  stats_image    = "${var.dockerhub_username}/portfolio-microservices-stats_service:${var.language_version}"
+
+  instance_user_data = templatefile("${path.module}/scripts/user_data.sh", {
+    base_dir               = jsonencode(var.deployment_base_dir)
+    bff_environment        = var.bff_environment
+    bff_image              = jsonencode(local.bff_image)
+    bff_upstream_url       = var.bff_upstream_url
+    docker_compose_version = var.docker_compose_version
+    domain_name            = var.domain_name
+    domain_name_shell      = jsonencode(var.domain_name)
+    language_image         = jsonencode(local.language_image)
+    stats_image            = jsonencode(local.stats_image)
+    stats_environment      = var.stats_environment
+  })
+}
+
 resource "aws_instance" "portfolio" {
   ami           = data.aws_ssm_parameter.amazon_linux_2023.value
   instance_type = var.instance_type
@@ -15,7 +35,7 @@ resource "aws_instance" "portfolio" {
 
   iam_instance_profile = aws_iam_instance_profile.ec2.name
 
-  user_data = file("${path.module}/scripts/user_data.sh")
+  user_data = local.instance_user_data
 
   user_data_replace_on_change = true
 
