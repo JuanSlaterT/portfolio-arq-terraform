@@ -1,0 +1,24 @@
+project_name = "portfolio"
+aws_region   = "us-east-1"
+
+instance_type    = "t3.small"
+root_volume_size = 20
+
+# Copia este archivo como terraform.tfvars y reemplaza los valores locales.
+# terraform.tfvars esta ignorado por Git y no debe versionarse.
+dockerhub_username = "replace-me"
+
+bff_version      = "latest"
+language_version = "latest"
+
+domain_name = "api.example.com"
+
+deployment_base_dir    = "/opt/portfolio"
+docker_compose_version = "v5.1.4"
+bff_upstream_url       = "http://bff:8080"
+
+bff_environment = {
+  LANGUAGE_SERVICE_URL = "http://language-service:8081"
+  # Agrega aqui tokens, claves u otras variables requeridas por el BFF.
+  # EXAMPLE_API_KEY = "replace-me"
+}
